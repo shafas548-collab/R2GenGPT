@@ -3,7 +3,7 @@ import json
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer, BitsAndBytesConfig
 from evalcap.bleu.bleu import Bleu
 from evalcap.rouge.rouge import Rouge
 from evalcap.cider.cider import Cider
@@ -11,10 +11,8 @@ from evalcap.meteor.meteor import Meteor
 from transformers import SwinModel
 from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
+from peft import LoraConfig, get_peft_model
 import pdb
-from kagglehub import model_upload
-
-
 
 class R2GenGPT(pl.LightningModule):
     """
@@ -45,37 +43,67 @@ class R2GenGPT(pl.LightningModule):
             print(f'Loading Frozen vision encoder:{args.vision_model} -- Done')
         else:
             print(f'Loading Trainable vision encoder:{args.vision_model} -- Done')
-
-        print('Loading LLAMA')
+        print('Loading LLAMA model...')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
         self.llama_tokenizer.pad_token_id = 0
+
+        # ============================================================
+        # 🔹 Case 1: Low-resource mode → 4-bit + QLoRA
+        # ============================================================
         if args.low_resource:
+            print("→ Low resource mode detected: loading 4-bit model with QLoRA")
+
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+            # ⛔ DDP-safe: no device_map="auto"
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 args.llama_model,
+                quantization_config=bnb_config,
                 torch_dtype=torch.float16,
-                load_in_8bit=True,
-                device_map="auto"
+                device_map=None,  
+                low_cpu_mem_usage=True
             )
-        else:
-            self.llama_model = LlamaForCausalLM.from_pretrained(
-                args.llama_model,
-                torch_dtype=torch.float16,
-            )
-         
-        if args.llm_use_lora:
+
+            # ✅ Tambahkan LoRA (QLoRA)
+            print("Applying QLoRA...")
             self.embed_tokens = self.llama_model.get_input_embeddings()
             peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM, inference_mode=False, r=args.llm_r, lora_alpha=args.llm_alpha, lora_dropout=args.lora_dropout
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=args.llm_r,
+                lora_alpha=args.llm_alpha,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                target_modules=["q_proj", "v_proj"]  # standar untuk LLAMA
             )
             self.llama_model = get_peft_model(self.llama_model, peft_config)
             self.llama_model.print_trainable_parameters()
-            print('Loading LLAMA LoRA Done')         
+            print("Loading 4-bit QLoRA LLAMA Done ✅")
+
+        # ============================================================
+        # 🔹 Case 2: Full mode → FP16 (no quantization, no LoRA)
+        # ============================================================
         else:
+            print("→ Full precision mode detected: loading FP16 model")
+            self.llama_model = LlamaForCausalLM.from_pretrained(
+                args.llama_model,
+                torch_dtype=torch.float16,
+                device_map=None  # DDP-safe
+            )
+
             self.embed_tokens = self.llama_model.get_input_embeddings()
             for name, param in self.llama_model.named_parameters():
                 param.requires_grad = False
-            print('Loading LLAMA Done')
+            print("Loading FP16 LLAMA Done ✅")
 
+        # ============================================================
+        # Linear projection for visual features → LLAMA space
+        # ============================================================
         self.llama_proj = nn.Linear(self.visual_encoder.num_features, self.llama_model.config.hidden_size)
         self.layer_norm = nn.LayerNorm(self.llama_model.config.hidden_size)
         self.end_sym = args.end_sym
@@ -195,8 +223,17 @@ class R2GenGPT(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         result = self(batch)
-        self.log_dict(result, prog_bar=True)
+        self.log("train_loss", result["loss"], prog_bar=True, on_step=False, on_epoch=False, logger=False)
         return result
+
+    def on_train_epoch_end(self):
+        epoch_loss = torch.stack(
+            [x['loss'] for x in self.trainer.fit_loop.epoch_loop.batch_loop.outputs]
+        ).mean()
+        
+        current_step = self.trainer.global_step  # ambil step terakhir dari epoch ini
+        self.log("train_epoch_loss", epoch_loss, on_epoch=True, on_step=False, logger=True, prog_bar=False)
+        self.logger.log_metrics({"train_epoch_loss": epoch_loss.item()}, step=current_step)
 
     def save_checkpoint(self, eval_res):
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
@@ -213,27 +250,19 @@ class R2GenGPT(pl.LightningModule):
             "epoch": current_epoch,
             "step":global_step
         }
-        os.makedirs(os.path.join(self.hparams.savedmodel_path, 'checkpoints'), exist_ok=True)
-        save_to = os.path.join(
-            self.hparams.savedmodel_path, 'checkpoints',
-            "checkpoint_epoch{}_step{}_bleu{:3f}_cider{:3f}.pth".format(current_epoch, global_step, eval_res['Bleu_4'], eval_res['CIDEr']),
-        )
-        self.print("Saving checkpoint at step {} to {}.".format(global_step, save_to))
+        # 🔹 Buat folder checkpoints
+        ckpt_dir = os.path.join(self.hparams.savedmodel_path, 'checkpoints')
+        if not os.path.exists(ckpt_dir):
+            os.makedirs(ckpt_dir, exist_ok=True)
+
+        filename = f"checkpoint_epoch{current_epoch}_step{global_step}_bleu{eval_res['Bleu_4']:.3f}_cider{eval_res['CIDEr']:.3f}.pth"
+        save_to = os.path.join(ckpt_dir, filename)
+
+        # 🔹 Simpan checkpoint
+        self.print(f"💾 Saving checkpoint at step {global_step} → {save_to}")
         torch.save(save_obj, save_to)
-
-        variation_slug = os.path.basename(self.hparams.savedmodel_path)
+        self.print("✅ Save checkpoint -- Done")
         
-        try:
-            model_upload(
-                handle=f"shafasalsabilaaa/R2GenGPT/pyTorch/{variation_slug}", 
-                local_model_dir=save_to,
-                version_notes=f"Update 2025-10-31"
-            )
-            self.print(f"Checkpoint uploaded to Kaggle Models ({variation_slug}).")
-
-            self.print(f"Local checkpoint {save_to} deleted.")
-        except Exception as e:
-            self.print(f"Failed to upload checkpoint to Kaggle Models: {e}")
     
     def validation_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
@@ -245,6 +274,11 @@ class R2GenGPT(pl.LightningModule):
             max_length=self.hparams.max_length,
             add_special_tokens=False
         )
+        
+        # 🔹 Hitung loss juga untuk val_loss
+        with torch.no_grad():
+            outputs_loss = self(samples)  # gunakan forward() yg sudah ada
+            val_loss = outputs_loss["loss"].detach()
 
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
@@ -273,7 +307,7 @@ class R2GenGPT(pl.LightningModule):
         )
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
-        self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+        self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"], "val_loss": val_loss})
         return hypo, ref
     
     def decode(self, output_token):
@@ -287,16 +321,23 @@ class R2GenGPT(pl.LightningModule):
         return output_text
 
     def on_validation_epoch_end(self):
-        ref, hypo, ids = [], [], []
+        ref, hypo, ids, val_losses = [], [], [], []
         for i in self.val_step_outputs:
             ref.extend(i['ref'])
             hypo.extend(i['hypo'])
             ids.extend(i['id'])
+            val_losses.append(i['val_loss'])
+        
+        # 🔹 Rata-rata val_loss untuk epoch
+        val_epoch_loss = torch.stack(val_losses).mean()
+        current_step = self.trainer.global_step
+        self.log("val_epoch_loss", val_epoch_loss, on_step=False, on_epoch=True, logger=True, prog_bar=False)
+        self.logger.log_metrics({"val_epoch_loss": val_epoch_loss.item()}, step=current_step)
 
         ref = {k:[v] for k, v in zip(ids, ref)}
         hypo = {k:[v] for k, v in zip(ids, hypo)}
         eval_res = self.score(ref=ref,hypo=hypo)
-        self.log_dict(eval_res, sync_dist=True, logger=True)
+        self.log_dict(eval_res, on_step=False, on_epoch=True, sync_dist=True, logger=True, prog_bar=False)
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
@@ -350,7 +391,7 @@ class R2GenGPT(pl.LightningModule):
             max_new_tokens=self.hparams.max_new_tokens,
             repetition_penalty=self.hparams.repetition_penalty,
             length_penalty=self.hparams.length_penalty,
-            temperature=self.hparams.temperature,
+            temperature=self.hparams.temperature, 
         )
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
