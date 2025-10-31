@@ -14,7 +14,7 @@ parser.add_argument('--prefetch_factor', default=4, type=int, help="use for trai
 parser.add_argument('--num_workers', default=8, type=int, help="Cpu num for dataloaders")
 
 # ========================= Model Settings ============================
-parser.add_argument('--vision_model', default='microsoft/swin-base-patch4-window7-224', type=str, help="vision model to use")
+parser.add_argument('--vision_model', default='microsoft/swin-small-patch4-window7-224', type=str, help="vision model to use")
 parser.add_argument('--llama_model', default='meta-llama/Llama-2-7b-chat-hf', type=str, help="LLM model to use")
 parser.add_argument('--freeze_vm', default=True, type=lambda x: (str(x).lower() == 'true'), help='freeze vision model')
 parser.add_argument('--llm_use_lora', default=False, type=lambda x: (str(x).lower() == 'true'), help="whether use lora for LLM model")
@@ -25,7 +25,7 @@ parser.add_argument('--vis_r', default=16, type=int, help='The dimension used by
 parser.add_argument('--vis_alpha', default=16, type=int, help='Scaling factor.')
 parser.add_argument('--lora_dropout', default=0.1, type=float, help='lora dropout')
 parser.add_argument('--global_only', default=False, type=lambda x: (str(x).lower() == 'true'), help='use global embedding only')
-parser.add_argument('--low_resource', default=False, type=bool)
+parser.add_argument('--low_resource', default=True, type=bool)
 parser.add_argument('--end_sym', default='</s>', type=str)
 
 # ======================== SavedModel Configs ===========================
