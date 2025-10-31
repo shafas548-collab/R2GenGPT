@@ -149,23 +149,39 @@ class R2GenGPT(pl.LightningModule):
     # ============================================================
     def encode_img(self, images):
         """
-        images: Tensor (B, C, H, W)
-        return:
-            inputs_llama: (B, L, H)
-            atts_llama:   (B, L)
+        Bikin input gambar selalu 4D sebelum masuk Swin.
+        Support:
+        - (B, C, H, W)
+        - (B, 1, C, H, W)
+        - (B, N, C, H, W)  → ambil view pertama
+        - (C, H, W)        → jadi (1, C, H, W)
         """
         device = images.device
 
-        if self.hparams.global_only:
-            # (B, D) → (B, 1, D)
-            image_embed = self.visual_encoder(images)["pooler_output"].unsqueeze(1)
-        else:
-            # (B, L, D)
-            image_embed = self.visual_encoder(images)["last_hidden_state"]
+        # 5D → buang dimensi tengah
+        if images.dim() == 5:
+            # misal (B, 1, C, H, W) atau (B, N, C, H, W)
+            images = images[:, 0]   # sekarang (B, C, H, W)
 
-        inputs_llama = self.llama_proj(image_embed)  # (B, L, hidden)
-        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long, device=device)
-        return inputs_llama, atts_llama
+        # 3D → tambahin batch
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+        # cek akhir
+        assert images.dim() == 4, f"encode_img expects 4D (B,C,H,W), got {images.shape}"
+
+        # lewatkan ke Swin
+        if self.hparams.global_only:
+            feats = self.visual_encoder(images)["pooler_output"].unsqueeze(1)   # (B, 1, D)
+        else:
+            feats = self.visual_encoder(images)["last_hidden_state"]            # (B, L, D)
+
+        # proyeksi ke ruang LLaMA
+        feats = self.llama_proj(feats)   # (B, L, hidden)
+        atts = torch.ones(feats.size()[:-1], dtype=torch.long, device=device)
+        return feats, atts
+
+
 
     # ============================================================
     # Prompt wrapper (dibetulin device-nya)
@@ -203,20 +219,33 @@ class R2GenGPT(pl.LightningModule):
     # Forward (train)
     # ============================================================
     def forward(self, samples):
+        # device rank ini
         device = next(self.parameters()).device
 
-        # --- image
+        # -------------------------
+        # 1) AMBIL & RAPIKAN IMAGE
+        # -------------------------
         image = samples["image"]
+
+        # kadang dataloader kirim list of tensors
         if isinstance(image, list):
             image = torch.stack(image, dim=0)
+
+        # ke device
         image = image.to(device)
 
-        # encode
-        img_embeds, atts_img = self.encode_img(image)
+        # kalau masih 5D (B,1,C,H,W) → jadi (B,C,H,W)
+        if image.dim() == 5 and image.size(1) == 1:
+            image = image[:, 0]
+
+        # lewat encode_img (yang sudah kita bikin aman)
+        img_embeds, atts_img = self.encode_img(image)     # (B, L, hidden)
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
-        # --- text
+        # -------------------------
+        # 2) SIAPKAN TEKS TARGET
+        # -------------------------
         self.llama_tokenizer.padding_side = "right"
         text = [t + self.end_sym for t in samples["input_text"]]
 
@@ -229,20 +258,29 @@ class R2GenGPT(pl.LightningModule):
             add_special_tokens=False,
         ).to(device)
 
+        # masking 0 → -100 biar loss ga ngitung padding
         targets = to_regress_tokens.input_ids.masked_fill(
             to_regress_tokens.input_ids == 0, -100
         )
 
-        # kosongkan target utk bagian gambar + bos
+        # -------------------------
+        # 3) BIKIN TARGET KOSONG UNTUK BAGIAN GAMBAR
+        #    (prompt + BOS tidak dihitung loss)
+        # -------------------------
         empty_targets = torch.ones(
-            (atts_img.shape[0], atts_img.shape[1] + 1),
+            (atts_img.shape[0], atts_img.shape[1] + 1),   # +1 untuk BOS nanti
             dtype=torch.long,
             device=device,
         ).fill_(-100)
+
         targets = torch.cat([empty_targets, targets], dim=1)
 
-        # --- build inputs
+        # -------------------------
+        # 4) BANGUN INPUTS LLaMA
+        # -------------------------
         batch_size = img_embeds.shape[0]
+
+        # BOS
         bos = torch.full(
             (batch_size, 1),
             fill_value=self.llama_tokenizer.bos_token_id,
@@ -250,25 +288,42 @@ class R2GenGPT(pl.LightningModule):
             device=device,
         )
 
-        # pastikan embed_tokens di device ini
+        # pastikan embed_tokens di device yg sama
         self.embed_tokens = self.embed_tokens.to(device)
 
-        bos_embeds = self.embed_tokens(bos)
-        atts_bos = atts_img[:, :1]
+        bos_embeds = self.embed_tokens(bos)          # (B, 1, hidden)
+        atts_bos  = atts_img[:, :1]                  # (B, 1)
 
-        to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)
+        # teks yg mau di-regress
+        to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)  # (B, T, hidden)
 
-        inputs_embeds = torch.cat([bos_embeds, img_embeds, to_regress_embeds], dim=1)
-        attention_mask = torch.cat([atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1)
+        # gabung semua embed:
+        # [BOS] + [PROMPT+IMG] + [TEXT TARGET]
+        inputs_embeds = torch.cat(
+            [bos_embeds, img_embeds, to_regress_embeds],
+            dim=1
+        )
 
+        # gabung attention mask:
+        # [1 untuk BOS] + [mask prompt/img] + [mask text]
+        attention_mask = torch.cat(
+            [atts_bos, atts_img, to_regress_tokens.attention_mask],
+            dim=1
+        )
+
+        # -------------------------
+        # 5) FORWARD KE LLAMA
+        # -------------------------
         outputs = self.llama_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             return_dict=True,
             labels=targets,
         )
+
         loss = outputs.loss
         return {"loss": loss}
+
 
     # ============================================================
     # Training
