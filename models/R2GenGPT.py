@@ -187,28 +187,25 @@ class R2GenGPT(pl.LightningModule):
     # Prompt wrapper (dibetulin device-nya)
     # ============================================================
     def prompt_wrap(self, img_embeds, atts_img):
-        device = img_embeds.device
-        # pastikan embed_tokens di device ini
+        # pastikan semua di device yg sama (rank GPU ini)
+        device = next(self.parameters()).device
         self.embed_tokens = self.embed_tokens.to(device)
 
         prompt = f"Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:"
         batch_size = img_embeds.shape[0]
         p_before, p_after = prompt.split("<ImageHere>")
 
+        # Tokenisasi + kirim ke device yang sama
         p_before_tokens = self.llama_tokenizer(
-            p_before,
-            return_tensors="pt",
-            add_special_tokens=False,
+            p_before, return_tensors="pt", add_special_tokens=False
         ).to(device)
-
         p_after_tokens = self.llama_tokenizer(
-            p_after,
-            return_tensors="pt",
-            add_special_tokens=False,
+            p_after, return_tensors="pt", add_special_tokens=False
         ).to(device)
 
-        p_before_embeds = self.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
-        p_after_embeds = self.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
+        # Pastikan input_ids dan embedding di device yang sama
+        p_before_embeds = self.embed_tokens(p_before_tokens.input_ids.to(device)).expand(batch_size, -1, -1)
+        p_after_embeds  = self.embed_tokens(p_after_tokens.input_ids.to(device)).expand(batch_size, -1, -1)
 
         wrapped_img_embeds = torch.cat([p_before_embeds, img_embeds, p_after_embeds], dim=1)
         wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1]).to(device)
