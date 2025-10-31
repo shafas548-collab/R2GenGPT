@@ -12,6 +12,7 @@ from transformers import SwinModel
 from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
 import pdb
+from kagglehub import model_upload
 
 
 
@@ -219,6 +220,20 @@ class R2GenGPT(pl.LightningModule):
         )
         self.print("Saving checkpoint at step {} to {}.".format(global_step, save_to))
         torch.save(save_obj, save_to)
+
+        variation_slug = os.path.basename(self.hparams.savedmodel_path)
+        
+        try:
+            model_upload(
+                handle=f"shafasalsabilaaa/R2GenGPT/pyTorch/{variation_slug}", 
+                local_model_dir=save_to,
+                version_notes=f"Update 2025-10-31"
+            )
+            self.print(f"Checkpoint uploaded to Kaggle Models ({variation_slug}).")
+
+            self.print(f"Local checkpoint {save_to} deleted.")
+        except Exception as e:
+            self.print(f"Failed to upload checkpoint to Kaggle Models: {e}")
     
     def validation_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
