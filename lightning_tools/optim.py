@@ -1,4 +1,4 @@
-from transformers import AdamW
+from torch.optim import AdamW
 import functools
 from torch.optim.lr_scheduler import LambdaLR
 

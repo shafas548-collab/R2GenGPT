@@ -2,7 +2,7 @@ import os
 import json
 import torch
 import torch.nn as nn
-import lightning.pytorch as pl
+import pytorch_lightning as pl
 from transformers import LlamaForCausalLM, LlamaTokenizer
 from evalcap.bleu.bleu import Bleu
 from evalcap.rouge.rouge import Rouge
