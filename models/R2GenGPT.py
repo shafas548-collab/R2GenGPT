@@ -158,94 +158,94 @@ class R2GenGPT(pl.LightningModule):
 
 
     def prompt_wrap(self, img_embeds, atts_img):
-    device = img_embeds.device
-    prompt = f'Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:'
-    batch_size = img_embeds.shape[0]
+        device = img_embeds.device
+        prompt = f'Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:'
+        batch_size = img_embeds.shape[0]
 
-    p_before, p_after = prompt.split('<ImageHere>')
-    p_before_tokens = self.llama_tokenizer(
-        p_before, return_tensors="pt", add_special_tokens=False
-    ).to(device)
-    p_after_tokens = self.llama_tokenizer(
-        p_after, return_tensors="pt", add_special_tokens=False
-    ).to(device)
+        p_before, p_after = prompt.split('<ImageHere>')
+        p_before_tokens = self.llama_tokenizer(
+            p_before, return_tensors="pt", add_special_tokens=False
+        ).to(device)
+        p_after_tokens = self.llama_tokenizer(
+            p_after, return_tensors="pt", add_special_tokens=False
+        ).to(device)
 
-    p_before_embeds = self.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
-    p_after_embeds = self.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
+        p_before_embeds = self.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
+        p_after_embeds = self.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
 
-    wrapped_img_embeds = torch.cat([p_before_embeds, img_embeds, p_after_embeds], dim=1)
-    wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1])
-    return wrapped_img_embeds, wrapped_atts_img
+        wrapped_img_embeds = torch.cat([p_before_embeds, img_embeds, p_after_embeds], dim=1)
+        wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1])
+        return wrapped_img_embeds, wrapped_atts_img
 
 
 
     def forward(self, samples):
-    # 1) ambil device tempat model ini lagi jalan (cuda:0 di rank 0, cuda:1 di rank 1)
-    device = next(self.parameters()).device
+        # 1) ambil device tempat model ini lagi jalan (cuda:0 di rank 0, cuda:1 di rank 1)
+        device = next(self.parameters()).device
 
-    # 2) pindahin image ke device itu
-    image = samples["image"].to(device)
+        # 2) pindahin image ke device itu
+        image = samples["image"].to(device)
 
-    # 3) encode image seperti biasa
-    img_embeds, atts_img = self.encode_img(image)
-    img_embeds = self.layer_norm(img_embeds)
+        # 3) encode image seperti biasa
+        img_embeds, atts_img = self.encode_img(image)
+        img_embeds = self.layer_norm(img_embeds)
 
-    # 4) bungkus prompt — di prompt_wrap juga nanti semua kita paksa ke device ini
-    img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
+        # 4) bungkus prompt — di prompt_wrap juga nanti semua kita paksa ke device ini
+        img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
-    # 5) siapkan teks target
-    self.llama_tokenizer.padding_side = "right"
-    text = [t + self.end_sym for t in samples["input_text"]]
+        # 5) siapkan teks target
+        self.llama_tokenizer.padding_side = "right"
+        text = [t + self.end_sym for t in samples["input_text"]]
 
-    to_regress_tokens = self.llama_tokenizer(
-        text,
-        return_tensors="pt",
-        padding="max_length",
-        truncation=True,
-        max_length=self.hparams.max_length,
-        add_special_tokens=False
-    ).to(device)   # <— penting: ke device yg sama
+        to_regress_tokens = self.llama_tokenizer(
+            text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.hparams.max_length,
+            add_special_tokens=False
+        ).to(device)   # <— penting: ke device yg sama
 
-    # 6) bikin target
-    targets = to_regress_tokens.input_ids.masked_fill(
-        to_regress_tokens.input_ids == 0, -100
-    )
+        # 6) bikin target
+        targets = to_regress_tokens.input_ids.masked_fill(
+            to_regress_tokens.input_ids == 0, -100
+        )
 
-    empty_targets = (
-        torch.ones(
-            [atts_img.shape[0], atts_img.shape[1] + 1],
-            dtype=torch.long,
+        empty_targets = (
+            torch.ones(
+                [atts_img.shape[0], atts_img.shape[1] + 1],
+                dtype=torch.long,
+                device=device,
+            ).fill_(-100)
+        )
+        targets = torch.cat([empty_targets, targets], dim=1)
+
+        # 7) BOS di device yg sama
+        batch_size = img_embeds.shape[0]
+        bos = torch.ones(
+            [batch_size, 1],
+            dtype=to_regress_tokens.input_ids.dtype,
             device=device,
-        ).fill_(-100)
-    )
-    targets = torch.cat([empty_targets, targets], dim=1)
+        ) * self.llama_tokenizer.bos_token_id
+        bos_embeds = self.embed_tokens(bos)
+        atts_bos = atts_img[:, :1]
 
-    # 7) BOS di device yg sama
-    batch_size = img_embeds.shape[0]
-    bos = torch.ones(
-        [batch_size, 1],
-        dtype=to_regress_tokens.input_ids.dtype,
-        device=device,
-    ) * self.llama_tokenizer.bos_token_id
-    bos_embeds = self.embed_tokens(bos)
-    atts_bos = atts_img[:, :1]
+        # 8) gabungkan semua embed
+        to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)
+        inputs_embeds = torch.cat([bos_embeds, img_embeds, to_regress_embeds], dim=1)
+        attention_mask = torch.cat(
+            [atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1
+        )
 
-    # 8) gabungkan semua embed
-    to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)
-    inputs_embeds = torch.cat([bos_embeds, img_embeds, to_regress_embeds], dim=1)
-    attention_mask = torch.cat(
-        [atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1
-    )
-
-    # 9) forward ke LLaMA
-    outputs = self.llama_model(
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        return_dict=True,
-        labels=targets,
-    )
-    loss = outputs.loss
-    return {"loss": loss}
+        # 9) forward ke LLaMA
+        outputs = self.llama_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            labels=targets,
+        )
+        loss = outputs.loss
+        return {"loss": loss}
 
 
     def training_step(self, batch, batch_idx):
