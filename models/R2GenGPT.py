@@ -369,6 +369,16 @@ class R2GenGPT(pl.LightningModule):
 
         return hypo, ref
 
+    def decode(self, output_token):
+        if output_token[0] == 0:  # the model might output a unknow token <unk> at the beginning. remove it
+            output_token = output_token[1:]
+        if output_token[0] == 1:  # some users find that there is a start token <s> at the beginning. remove it
+            output_token = output_token[1:]
+        output_text = self.llama_tokenizer.decode(output_token, add_special_tokens=False)
+        output_text = output_text.split('</s>')[0].strip()
+        output_text = output_text.replace('<unk>', '')
+        return output_text
+
     def on_validation_epoch_end(self):
         # gabungkan semua output dari tiap batch
         ref, hypo, ids, val_losses = [], [], [], []
