@@ -1,4 +1,4 @@
-from lightning.pytorch import LightningDataModule
+from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from dataset.data_helper import create_datasets
 
@@ -70,4 +70,5 @@ class DataModule(LightningDataModule):
     def test_dataloader(self):
         loader = DataLoader(self.dataset["test"], batch_size=self.args.test_batch_size, drop_last=False, pin_memory=False,
                         num_workers=self.args.num_workers, prefetch_factor=self.args.prefetch_factor)
+
         return loader
