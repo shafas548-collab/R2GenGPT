@@ -158,44 +158,54 @@ class R2GenGPT(pl.LightningModule):
 
 
     def prompt_wrap(self, img_embeds, atts_img):
+        # ambil device batch ini (rank ini)
         device = img_embeds.device
+
         prompt = f'Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:'
         batch_size = img_embeds.shape[0]
-
         p_before, p_after = prompt.split('<ImageHere>')
+
+        # tokenizer SELALU ke device yang sama dgn img_embeds
         p_before_tokens = self.llama_tokenizer(
-            p_before, return_tensors="pt", add_special_tokens=False
-        ).to(device)
-        p_after_tokens = self.llama_tokenizer(
-            p_after, return_tensors="pt", add_special_tokens=False
+            p_before,
+            return_tensors="pt",
+            add_special_tokens=False
         ).to(device)
 
+        p_after_tokens = self.llama_tokenizer(
+            p_after,
+            return_tensors="pt",
+            add_special_tokens=False
+        ).to(device)
+
+        # embed_tokens juga sudah di device itu (karena DDP mindahin model)
         p_before_embeds = self.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
         p_after_embeds = self.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
 
         wrapped_img_embeds = torch.cat([p_before_embeds, img_embeds, p_after_embeds], dim=1)
-        wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1])
+        wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1]).to(device)
+
         return wrapped_img_embeds, wrapped_atts_img
 
 
 
     def forward(self, samples):
-        # device rank ini (cuda:0 di rank 0, cuda:1 di rank 1)
+        # device rank ini
         device = next(self.parameters()).device
 
-        # 1) image di dataset kamu = list of tensors
-        images = samples["image"]
-        # pastikan semua ke device
-        images = [img.to(device) for img in images]
+        # image dari dataloader kamu bentuknya list → stack dulu
+        image = samples["image"]
+        if isinstance(image, list):
+            image = torch.stack(image, dim=0)
+        image = image.to(device)
 
-        # 2) encode image (fungsi kamu memang expect list)
-        img_embeds, atts_img = self.encode_img(images)
+        # encode image → sudah otomatis di device
+        img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
 
-        # 3) bungkus prompt → ini juga harus di device yg sama
+        # BUNGKUS PROMPT (ini tadi error)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
-        # 4) text
         self.llama_tokenizer.padding_side = "right"
         text = [t + self.end_sym for t in samples["input_text"]]
 
@@ -206,35 +216,34 @@ class R2GenGPT(pl.LightningModule):
             truncation=True,
             max_length=self.hparams.max_length,
             add_special_tokens=False
-        ).to(device)
+        ).to(device)   # ← WAJIB
 
-        # 5) target
         targets = to_regress_tokens.input_ids.masked_fill(
             to_regress_tokens.input_ids == 0, -100
         )
 
+        # target kosong buat bagian gambar + BOS
         empty_targets = torch.ones(
             (atts_img.shape[0], atts_img.shape[1] + 1),
             dtype=torch.long,
-            device=device,
+            device=device
         ).fill_(-100)
+
         targets = torch.cat([empty_targets, targets], dim=1)
 
-        # 6) BOS + embed
         batch_size = img_embeds.shape[0]
-        bos = torch.ones(
+        bos = torch.full(
             (batch_size, 1),
-            dtype=to_regress_tokens.input_ids.dtype,
-            device=device,
-        ) * self.llama_tokenizer.bos_token_id
+            fill_value=self.llama_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device
+        )
         bos_embeds = self.embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)
         inputs_embeds = torch.cat([bos_embeds, img_embeds, to_regress_embeds], dim=1)
-        attention_mask = torch.cat(
-            [atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1
-        )
+        attention_mask = torch.cat([atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1)
 
         outputs = self.llama_model(
             inputs_embeds=inputs_embeds,
@@ -290,7 +299,10 @@ class R2GenGPT(pl.LightningModule):
         
     
     def validation_step(self, samples, batch_idx):
-        self.llama_tokenizer.padding_side = "right"
+        # device rank ini
+        device = next(self.parameters()).device
+
+        # --- 1) siapkan text target di device ini
         to_regress_tokens = self.llama_tokenizer(
             samples['input_text'],
             return_tensors="pt",
@@ -298,129 +310,202 @@ class R2GenGPT(pl.LightningModule):
             truncation=True,
             max_length=self.hparams.max_length,
             add_special_tokens=False
-        )
-        
-        # 🔹 Hitung loss juga untuk val_loss
+        ).to(device)
+
+        # --- 2) hitung loss pakai forward() (forward kamu sudah DDP-safe)
         with torch.no_grad():
-            outputs_loss = self(samples)  # gunakan forward() yg sudah ada
+            outputs_loss = self(samples)
             val_loss = outputs_loss["loss"].detach()
 
+        # --- 3) siapkan image
         image = samples["image"]
+        if isinstance(image, list):               # dataloader kamu kirim list
+            image = torch.stack(image, dim=0)
+        image = image.to(device)
+
+        # encode → prompt wrap → semua di device ini
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
         batch_size = img_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                         dtype=atts_img.dtype,
-                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
+
+        bos = torch.full(
+            (batch_size, 1),
+            fill_value=self.llama_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
         bos_embeds = self.embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_img], dim=1)
 
-        outputs = self.llama_model.generate(
-            inputs_embeds=inputs_embeds,
-            num_beams=self.hparams.beam_size,
-            do_sample=self.hparams.do_sample,
-            min_new_tokens=self.hparams.min_new_tokens,
-            max_new_tokens=self.hparams.max_new_tokens,
-            repetition_penalty=self.hparams.repetition_penalty,
-            length_penalty=self.hparams.length_penalty,
-            temperature=self.hparams.temperature,
-        )
+        # --- 4) generate di device ini
+        with torch.no_grad():
+            outputs = self.llama_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                num_beams=self.hparams.beam_size,
+                do_sample=self.hparams.do_sample,
+                min_new_tokens=self.hparams.min_new_tokens,
+                max_new_tokens=self.hparams.max_new_tokens,
+                repetition_penalty=self.hparams.repetition_penalty,
+                length_penalty=self.hparams.length_penalty,
+                temperature=self.hparams.temperature,
+            )
+
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
-        self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"], "val_loss": val_loss})
+
+        # simpan buat di-merge di on_validation_epoch_end
+        self.val_step_outputs.append({
+            "hypo": hypo,
+            "ref": ref,
+            "id": samples["id"],
+            "val_loss": val_loss
+        })
+
         return hypo, ref
-    
-    def decode(self, output_token):
-        if output_token[0] == 0:  # the model might output a unknow token <unk> at the beginning. remove it
-            output_token = output_token[1:]
-        if output_token[0] == 1:  # some users find that there is a start token <s> at the beginning. remove it
-            output_token = output_token[1:]
-        output_text = self.llama_tokenizer.decode(output_token, add_special_tokens=False)
-        output_text = output_text.split('</s>')[0].strip()
-        output_text = output_text.replace('<unk>', '')
-        return output_text
 
     def on_validation_epoch_end(self):
+        # gabungkan semua output dari tiap batch
         ref, hypo, ids, val_losses = [], [], [], []
-        for i in self.val_step_outputs:
-            ref.extend(i['ref'])
-            hypo.extend(i['hypo'])
-            ids.extend(i['id'])
-            val_losses.append(i['val_loss'])
-        
-        # 🔹 Rata-rata val_loss untuk epoch
-        val_epoch_loss = torch.stack(val_losses).mean()
-        current_step = self.trainer.global_step
-        self.log("val_epoch_loss", val_epoch_loss, on_step=False, on_epoch=True, logger=True, prog_bar=False)
-        self.logger.log_metrics({"val_epoch_loss": val_epoch_loss.item()}, step=current_step)
+        for item in self.val_step_outputs:
+            ref.extend(item["ref"])
+            hypo.extend(item["hypo"])
+            ids.extend(item["id"])
+            val_losses.append(item["val_loss"])
 
-        ref = {k:[v] for k, v in zip(ids, ref)}
-        hypo = {k:[v] for k, v in zip(ids, hypo)}
-        eval_res = self.score(ref=ref,hypo=hypo)
-        self.log_dict(eval_res, on_step=False, on_epoch=True, sync_dist=True, logger=True, prog_bar=False)
+        # kalau memang ada batch di rank itu
+        if len(val_losses) > 0:
+            val_epoch_loss = torch.stack(val_losses).mean()
+        else:
+            # jaga-jaga kalau rank ini nggak dapat batch
+            val_epoch_loss = torch.tensor(
+                0.0, device=next(self.parameters()).device
+            )
 
-        result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
-        os.makedirs(result_folder, exist_ok=True)
-        current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
-        json.dump(hypo, open(os.path.join(result_folder, f"result_{current_epoch}_{global_step}" + '.json'), 'w'))
-        json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
-        self.print(eval_res)
+        # log ke Lightning (disync ke semua rank)
+        self.log(
+            "val_epoch_loss",
+            val_epoch_loss,
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
 
-        val_score = 0
-        for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):
-            val_score += eval_res[score_type] * weight
+        # jadiin dict buat evalcap
+        ref = {k: [v] for k, v in zip(ids, ref)}
+        hypo = {k: [v] for k, v in zip(ids, hypo)}
 
-        if self.trainer.local_rank == 0:
+        # hitung metric & simpan file cuma di rank 0
+        if self.trainer.is_global_zero:
+            eval_res = self.score(ref=ref, hypo=hypo)
+
+            # log ke logger
+            if self.logger is not None:
+                self.logger.log_metrics(
+                    {k: float(v) for k, v in eval_res.items()},
+                    step=self.trainer.global_step,
+                )
+
+            # simpan hasil JSON
+            result_folder = os.path.join(self.hparams.savedmodel_path, "result")
+            os.makedirs(result_folder, exist_ok=True)
+            current_epoch = self.trainer.current_epoch
+            global_step = self.trainer.global_step
+
+            json.dump(
+                hypo,
+                open(
+                    os.path.join(
+                        result_folder,
+                        f"result_{current_epoch}_{global_step}.json",
+                    ),
+                    "w",
+                ),
+            )
+            json.dump(
+                ref,
+                open(os.path.join(result_folder, "refs.json"), "w"),
+            )
+            self.print(eval_res)
+
+            # pilih skor terbaik buat nyimpen checkpoint
+            val_score = 0
+            for score_type, weight in zip(
+                self.hparams.scorer_types, self.hparams.weights
+            ):
+                val_score += eval_res[score_type] * weight
+
             if val_score > self.val_score:
                 self.save_checkpoint(eval_res)
                 self.val_score = val_score
+
+        # kosongkan buffer biar epoch berikutnya bersih
         self.val_step_outputs.clear()
 
-
     def test_step(self, samples, batch_idx):
+        device = next(self.parameters()).device
         self.llama_tokenizer.padding_side = "right"
+
+        # text target
         to_regress_tokens = self.llama_tokenizer(
-            samples['input_text'],
+            samples["input_text"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=self.hparams.max_length,
-            add_special_tokens=False
-        )
+            add_special_tokens=False,
+        ).to(device)
 
+        # image
         image = samples["image"]
+        if isinstance(image, list):
+            image = torch.stack(image, dim=0)
+        image = image.to(device)
+
+        # encode image
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
         batch_size = img_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                         dtype=atts_img.dtype,
-                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
+        bos = torch.full(
+            (batch_size, 1),
+            fill_value=self.llama_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
         bos_embeds = self.embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_img], dim=1)
 
-        outputs = self.llama_model.generate(
-            inputs_embeds=inputs_embeds,
-            num_beams=self.hparams.beam_size,
-            do_sample=self.hparams.do_sample,
-            min_new_tokens=self.hparams.min_new_tokens,
-            max_new_tokens=self.hparams.max_new_tokens,
-            repetition_penalty=self.hparams.repetition_penalty,
-            length_penalty=self.hparams.length_penalty,
-            temperature=self.hparams.temperature, 
-        )
+        with torch.no_grad():
+            outputs = self.llama_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                num_beams=self.hparams.beam_size,
+                do_sample=self.hparams.do_sample,
+                min_new_tokens=self.hparams.min_new_tokens,
+                max_new_tokens=self.hparams.max_new_tokens,
+                repetition_penalty=self.hparams.repetition_penalty,
+                length_penalty=self.hparams.length_penalty,
+                temperature=self.hparams.temperature,
+            )
+
         hypo = [self.decode(i) for i in outputs]
-        ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
-        self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+        ref = [self.decode(i) for i in to_regress_tokens["input_ids"]]
+
+        self.test_step_outputs.append(
+            {"hypo": hypo, "ref": ref, "id": samples["id"]}
+        )
         return hypo, ref
 
 
