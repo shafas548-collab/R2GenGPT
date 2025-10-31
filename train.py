@@ -4,8 +4,8 @@ from configs.config import parser
 from dataset.data_module import DataModule
 from lightning_tools.callbacks import add_callbacks
 from models.R2GenGPT import R2GenGPT
-from lightning.pytorch import seed_everything
-import lightning.pytorch as pl
+from pytorch_lightning import seed_everything
+import pytorch_lightning as pl
 
  
 def train(args):
@@ -48,4 +48,5 @@ def main():
 
 
 if __name__ == '__main__':
+
     main()
