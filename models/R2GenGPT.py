@@ -15,6 +15,9 @@ from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
 from peft import LoraConfig, get_peft_model
 import pdb
+import time
+import psutil
+
 
 class R2GenGPT(pl.LightningModule):
     """
@@ -266,9 +269,24 @@ class R2GenGPT(pl.LightningModule):
         return {"loss": loss}
 
     def training_step(self, batch, batch_idx):
+        start_gpu_mem = torch.cuda.memory_allocated() / 1e6  # MB
+        start_time = time.time()
+
         result = self(batch)
-        self.log_dict(result, prog_bar=True)
+        loss = result["loss"]
+
+        end_time = time.time()
+        end_gpu_mem = torch.cuda.memory_allocated() / 1e6
+
+        gpu_usage = end_gpu_mem - start_gpu_mem
+        step_time = end_time - start_time
+
+        self.log("train_loss", loss, prog_bar=True)
+        self.log("gpu_usage_mb", gpu_usage)
+        self.log("train_step_time", step_time)
+
         return result
+
 
     def save_checkpoint(self, eval_res):
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
@@ -298,16 +316,15 @@ class R2GenGPT(pl.LightningModule):
         
     
     def validation_step(self, samples, batch_idx):
-        self.llama_tokenizer.padding_side = "right"
-        to_regress_tokens = self.llama_tokenizer(
-            samples['input_text'],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.hparams.max_length,
-            add_special_tokens=False
-        )
+        import time
+        import torch
 
+        # --- Mulai pengukuran waktu & GPU ---
+        torch.cuda.synchronize()
+        start_time = time.time()
+        start_gpu = torch.cuda.memory_allocated() / 1e6  # MB
+
+        # --- Proses normal yang sudah ada ---
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
@@ -315,8 +332,8 @@ class R2GenGPT(pl.LightningModule):
 
         batch_size = img_embeds.shape[0]
         bos = torch.ones([batch_size, 1],
-                         dtype=atts_img.dtype,
-                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
+                        dtype=atts_img.dtype,
+                        device=atts_img.device) * self.llama_tokenizer.bos_token_id
         bos_embeds = self.embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
@@ -333,10 +350,34 @@ class R2GenGPT(pl.LightningModule):
             length_penalty=self.hparams.length_penalty,
             temperature=self.hparams.temperature,
         )
+
+        # --- Akhiri pengukuran waktu & GPU ---
+        torch.cuda.synchronize()
+        end_time = time.time()
+        end_gpu = torch.cuda.memory_allocated() / 1e6
+
+        latency = end_time - start_time
+        gpu_usage = end_gpu - start_gpu
+
+        # --- Dekode hasil ---
         hypo = [self.decode(i) for i in outputs]
-        ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
-        self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+        ref = [self.decode(i) for i in samples['to_regress_tokens']['input_ids']]
+
+        # --- Simpan hasil dan metrik tambahan ---
+        self.val_step_outputs.append({
+            "hypo": hypo,
+            "ref": ref,
+            "id": samples["id"],
+            "latency": latency,
+            "gpu_usage_mb": gpu_usage
+        })
+
+        # --- Log ke trainer bar (agar muncul di progress bar) ---
+        self.log("val_latency_sec", latency, prog_bar=True)
+        self.log("val_gpu_usage_mb", gpu_usage, prog_bar=False)
+
         return hypo, ref
+
     
     def decode(self, output_token):
         if output_token[0] == 0:  # the model might output a unknow token <unk> at the beginning. remove it
@@ -379,6 +420,10 @@ class R2GenGPT(pl.LightningModule):
 
 
     def test_step(self, samples, batch_idx):
+        import time
+        import torch
+
+        # --- Awal: setup tokenizer ---
         self.llama_tokenizer.padding_side = "right"
         to_regress_tokens = self.llama_tokenizer(
             samples['input_text'],
@@ -387,22 +432,29 @@ class R2GenGPT(pl.LightningModule):
             truncation=True,
             max_length=self.hparams.max_length,
             add_special_tokens=False
-        )
+        ).to(self.device)
 
+        # --- Encode image ---
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
+        # --- Tambah BOS token ---
         batch_size = img_embeds.shape[0]
         bos = torch.ones([batch_size, 1],
-                         dtype=atts_img.dtype,
-                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
+                        dtype=atts_img.dtype,
+                        device=atts_img.device) * self.llama_tokenizer.bos_token_id
         bos_embeds = self.embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
+        # --- Concatenate embeddings dan attention mask ---
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_img], dim=1)
+
+        # --- Ukur latensi inferensi (sinkron GPU biar akurat) ---
+        torch.cuda.synchronize()
+        inf_start = time.time()
 
         outputs = self.llama_model.generate(
             inputs_embeds=inputs_embeds,
@@ -412,24 +464,42 @@ class R2GenGPT(pl.LightningModule):
             max_new_tokens=self.hparams.max_new_tokens,
             repetition_penalty=self.hparams.repetition_penalty,
             length_penalty=self.hparams.length_penalty,
-            temperature=self.hparams.temperature, 
+            temperature=self.hparams.temperature,
         )
+
+        torch.cuda.synchronize()
+        inf_end = time.time()
+        latency = inf_end - inf_start
+
+        # --- Logging latensi per batch ---
+        self.log("test_latency_sec", latency, prog_bar=True, on_step=True)
+
+        # --- Decode hasil output dan referensi ---
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
-        self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+
+        # --- Simpan hasil untuk evaluasi akhir ---
+        self.test_step_outputs.append({
+            "hypo": hypo,
+            "ref": ref,
+            "id": samples["id"],
+            "latency": latency
+        })
+
         return hypo, ref
 
 
+
     def on_test_epoch_end(self):
-        """
-        This function is called at the end of the test epoch.
-        It is recommended to test on single device to ensure each sample/batch gets evaluated exactly once. This is helpful to make sure benchmarking for research papers is done the right way. Otherwise, in a multi-device setting, samples could occur duplicated when DistributedSampler is used, for eg. with strategy="ddp". It replicates some samples on some devices to make sure all devices have same batch size in case of uneven inputs.
-        """
-        ref, hypo, ids = [], [], []
+        ref, hypo, ids, latencies = [], [], [], []
         for i in self.test_step_outputs:
             ref.extend(i['ref'])
             hypo.extend(i['hypo'])
             ids.extend(i['id'])
+            latencies.append(i['latency'])
+
+        avg_latency = sum(latencies) / len(latencies)
+        print(f"Average inference latency: {avg_latency:.3f} sec/sample")
 
         ref = {k:[v] for k, v in zip(ids, ref)}
         hypo = {k:[v] for k, v in zip(ids, hypo)}
@@ -437,9 +507,11 @@ class R2GenGPT(pl.LightningModule):
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
-        json.dump(hypo, open(os.path.join(result_folder, f"test_result.json"), 'w'))
-        json.dump(ref, open(os.path.join(result_folder, 'test_refs.json'), 'w'))
-        self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
+        json.dump({
+            "metrics": eval_res,
+            "avg_latency": avg_latency
+        }, open(os.path.join(result_folder, "test_summary.json"), "w"))
+
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
