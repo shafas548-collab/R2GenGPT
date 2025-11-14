@@ -173,56 +173,62 @@ class R2GenGPT(pl.LightningModule):
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
             
-    # =========================LOGGING GPU & CPU UTILIZATION TRAIN & VAL=========================          
     def _log_gpu_cpu_epoch(self, prefix):
-        """
-        prefix: train / val
-        Mengumpulkan:
-        - avg vram dalam 1 epoch
-        - peak vram dalam 1 epoch
-        - avg util
-        - peak util
-        untuk 2 GPU melalui all_gather
-        """
+    """
+    prefix: "train" atau "val"
+    Mengumpulkan:
+    - avg & peak VRAM
+    - avg & peak GPU Util
+    Mendukung:
+    - single GPU
+    - multi-GPU (auto adaptasi)
+    """
 
-        # local values
-        avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
-        peak_vram_local = float(max(self._epoch_vram))
+    # ===================== Local GPU Stats =====================
+    avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
+    peak_vram_local = float(max(self._epoch_vram))
 
-        avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
-        peak_util_local = float(max(self._epoch_util))
+    avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
+    peak_util_local = float(max(self._epoch_util))
 
-        # convert to tensors for gathering
-        t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
-        t_peak_vram = torch.tensor(peak_vram_local, device=self.device)
-        t_avg_util = torch.tensor(avg_util_local, device=self.device)
-        t_peak_util = torch.tensor(peak_util_local, device=self.device)
+    # convert to tensor
+    t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
+    t_peak_vram = torch.tensor(peak_vram_local, device=self.device)
+    t_avg_util = torch.tensor(avg_util_local, device=self.device)
+    t_peak_util = torch.tensor(peak_util_local, device=self.device)
 
-        # all ranks gather → shape (world_size,)
-        all_avg_vram = self.all_gather(t_avg_vram).detach().cpu().tolist()
-        all_peak_vram = self.all_gather(t_peak_vram).detach().cpu().tolist()
+    # ===================== All Gather (multi-gpu safe) =====================
+    all_avg_vram = self.all_gather(t_avg_vram).cpu().tolist()
+    all_peak_vram = self.all_gather(t_peak_vram).cpu().tolist()
+    all_avg_util = self.all_gather(t_avg_util).cpu().tolist()
+    all_peak_util = self.all_gather(t_peak_util).cpu().tolist()
 
-        all_avg_util = self.all_gather(t_avg_util).detach().cpu().tolist()
-        all_peak_util = self.all_gather(t_peak_util).detach().cpu().tolist()
+    # ===================== Logging =====================
+    if self.trainer.is_global_zero:
 
-        # only rank 0 logs
-        if self.trainer.is_global_zero:
-            # GPU0 = index 0, GPU1 = index 1
-            self.log(f"{prefix}_gpu0_avg_vram", all_avg_vram[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_vram", all_avg_vram[1], on_epoch=True, rank_zero_only=True)
+        num_gpus = len(all_avg_vram)
 
-            self.log(f"{prefix}_gpu0_peak_vram", all_peak_vram[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_vram", all_peak_vram[1], on_epoch=True, rank_zero_only=True)
+        # log otomatis sesuai jumlah GPU (1, 2, 4, ...)
+        for i in range(num_gpus):
+            self.log(f"{prefix}_gpu{i}_avg_vram",
+                     all_avg_vram[i], on_epoch=True, rank_zero_only=True)
 
-            self.log(f"{prefix}_gpu0_avg_util", all_avg_util[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_util", all_avg_util[1], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu{i}_peak_vram",
+                     all_peak_vram[i], on_epoch=True, rank_zero_only=True)
 
-            self.log(f"{prefix}_gpu0_peak_util", all_peak_util[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_util", all_peak_util[1], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu{i}_avg_util",
+                     all_avg_util[i], on_epoch=True, rank_zero_only=True)
 
-            # CPU snapshot tetap
-            mem = psutil.virtual_memory()
-            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)           
+            self.log(f"{prefix}_gpu{i}_peak_util",
+                     all_peak_util[i], on_epoch=True, rank_zero_only=True)
+
+        # CPU log
+        mem = psutil.virtual_memory()
+        self.log(f"{prefix}_cpu_ram",
+                 mem.used / (1024 ** 3),
+                 on_epoch=True,
+                 rank_zero_only=True)
+           
 
     def score(self, ref, hypo):
         """
