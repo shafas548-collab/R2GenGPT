@@ -6,7 +6,7 @@ from lightning_tools.callbacks import add_callbacks
 from models.R2GenGPT import R2GenGPT
 from pytorch_lightning import seed_everything
 import pytorch_lightning as pl
-import warnings, logging
+import warnings
 import transformers
 
 # 🔇 Matikan warning umum
@@ -16,35 +16,36 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # 🔇 Matikan semua log Hugging Face (transformers)
 transformers.utils.logging.set_verbosity_error()
 
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("absl").setLevel(logging.ERROR)
 
- 
 def train(args):
-    dm = DataModule(args)
-    callbacks = add_callbacks(args)
+    seed_everything(42, workers=True)
 
+    # 1) bangun model DULU
+    model = build_model(args)
+
+    # 2) baru bangun datamodule
+    dm = DataModule(args)
+
+    # 3) callback & logger
+    cb = add_callbacks(args)
+
+    # 4) trainer
     trainer = pl.Trainer(
-        devices=args.devices,
+        accelerator=args.accelerator,   # "gpu"
+        devices=args.devices,           # 2
         num_nodes=args.num_nodes,
-        strategy=args.strategy,
-        accelerator=args.accelerator,
+        strategy=args.strategy,         # "ddp"
         precision=args.precision,
-        val_check_interval = args.val_check_interval,
-        limit_val_batches = args.limit_val_batches,
-        max_epochs = args.max_epochs,
-        num_sanity_val_steps = args.num_sanity_val_steps,
+        val_check_interval=args.val_check_interval,
+        limit_val_batches=args.limit_val_batches,
+        max_epochs=args.max_epochs,
+        num_sanity_val_steps=args.num_sanity_val_steps,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=callbacks["callbacks"], 
-        logger=callbacks["loggers"]
+        callbacks=cb["callbacks"],
+        logger=cb["loggers"],
     )
 
-    if args.ckpt_file is not None:
-        model = R2GenGPT.load_from_checkpoint(args.ckpt_file, strict=False)
-    else:
-        model = R2GenGPT(args)
-
+    # 5) run
     if args.test:
         trainer.test(model, datamodule=dm)
     elif args.validate:
@@ -52,13 +53,13 @@ def train(args):
     else:
         trainer.fit(model, datamodule=dm)
 
+
 def main():
     args = parser.parse_args()
     os.makedirs(args.savedmodel_path, exist_ok=True)
     pprint(vars(args))
-    seed_everything(42, workers=True)
     train(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

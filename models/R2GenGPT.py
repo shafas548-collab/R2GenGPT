@@ -2,64 +2,69 @@ import os
 import json
 import torch
 import torch.serialization
-from lightning_fabric.utilities.data import AttributeDict
 import torch.nn as nn
 import pytorch_lightning as pl
-from transformers import LlamaForCausalLM, LlamaTokenizer, BitsAndBytesConfig
+from transformers import (
+    LlamaForCausalLM,
+    LlamaTokenizer,
+    BitsAndBytesConfig,
+    SwinModel,
+)
 from evalcap.bleu.bleu import Bleu
 from evalcap.rouge.rouge import Rouge
 from evalcap.cider.cider import Cider
 from evalcap.meteor.meteor import Meteor
 from transformers import SwinModel
+from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
-import numpy as np
-import pynvml, psutil, time, csv
-pynvml.nvmlInit()
+from peft import LoraConfig, get_peft_model
+import pdb
 
 class R2GenGPT(pl.LightningModule):
     """
-    R2GenGPT model.
+    DDP-safe version.
+    - TIDAK menyimpan self.embed_tokens permanen (karena bisa beda device per rank)
+    - SETIAP forward ambil ulang dari self.llama_model.get_input_embeddings()
     """
+
     def __init__(self, args):
         super().__init__()
         self.args = args
         self.save_hyperparameters(args)
 
-        print(f'Loading vision encoder:{args.vision_model}')
+        # -------------------------------------------------
+        # 1) Vision encoder
+        # -------------------------------------------------
+        print(f"[R2GenGPT] Loading vision encoder: {args.vision_model}")
         self.visual_encoder = SwinModel.from_pretrained(args.vision_model)
+
         if args.vis_use_lora:
             peft_config_visual = LoraConfig(
                                     r=args.vis_r,
                                     lora_alpha=args.vis_alpha,
                                     target_modules=["query", "value"],
-                                    lora_dropout=args.vis_lora_dropout,
+                                    lora_dropout=args.lora_dropout,
                                     bias="none",
                                     modules_to_save=["classifier"],
                                 )
             self.visual_encoder = get_peft_model(self.visual_encoder, peft_config_visual)
             self.visual_encoder.print_trainable_parameters()
-            print('Loading vision encoder with LoRA -- Done')
+            print("[R2GenGPT] Vision encoder with LoRA -- Done")
         elif args.freeze_vm:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
-            trainable_params = sum(p.numel() for p in self.visual_encoder.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in self.visual_encoder.parameters())
-            print(f"[Vision Encoder] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
             print(f'Loading Frozen vision encoder:{args.vision_model} -- Done')
         else:
-            trainable_params = sum(p.numel() for p in self.visual_encoder.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in self.visual_encoder.parameters())
-            print(f"[Vision Encoder] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
-            print(f'Loading Full Trainable vision encoder:{args.vision_model} -- Done')
+            print(f'Loading Trainable vision encoder:{args.vision_model} -- Done')
         print('Loading LLAMA model...')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
         self.llama_tokenizer.pad_token_id = 0
+
         # ============================================================
         # 🔹 Case 1: Low-resource mode → 4-bit + QLoRA
         # ============================================================
         if args.low_resource:
-            print("→ Low resource mode detected: loading 4-bit model with QLoRA")
-
+            print("[R2GenGPT] Low-resource: load 4-bit + QLoRA")
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -67,17 +72,14 @@ class R2GenGPT(pl.LightningModule):
                 bnb_4bit_use_double_quant=True,
             )
 
-            # ⛔ DDP-safe: no device_map="auto"
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 args.llama_model,
                 quantization_config=bnb_config,
                 torch_dtype=torch.float16,
                 device_map=None,   # ❌ jangan "auto" (DDP unsafe)
+                low_cpu_mem_usage=True
             )
 
-            # ✅ Tambahkan LoRA (QLoRA)
-            print("Applying QLoRA...")
-            self.embed_tokens = self.llama_model.get_input_embeddings()
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 inference_mode=False,
@@ -85,46 +87,39 @@ class R2GenGPT(pl.LightningModule):
                 lora_alpha=args.llm_alpha,
                 lora_dropout=args.llm_lora_dropout,
                 bias="none",
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
-
+                target_modules=["q_proj", "v_proj"]  # standar untuk LLAMA
             )
             self.llama_model = get_peft_model(self.llama_model, peft_config)
             self.llama_model.print_trainable_parameters()
             print("Loading 4-bit QLoRA LLAMA Done ✅")
             
         # ============================================================
-        # 🔹 Case 2: Fake QAT + Freeze (lm_head only)
+        # 🔹 Case 2: Fake QAT + Freeze
         # ============================================================
+            
         elif args.fake_qat:
-            print("→ Fake QAT Simulasi INT8 aktif (lm_head only, clean mode)")
+            print("→ QAT-Fake mode detected: LLaMA frozen, fake quant active")
 
-            # 1️⃣ Load model di FP16
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 args.llama_model,
                 torch_dtype=torch.float16,
                 device_map=None,
             )
-            self.llama_model.eval()  # stabilisasi LayerNorm dan Dropout
 
-            # 2️⃣ Freeze semua parameter (hemat & aman)
+            # Freeze semua parameter (LLM tidak dilatih)
             for name, param in self.llama_model.named_parameters():
                 param.requires_grad = False
 
-            # 3️⃣ Fake quantisasi simulasi pada lm_head
-            w = self.llama_model.lm_head.weight.data
-            qmin, qmax = -128, 127
-            scale = w.abs().max() / max(qmax, 1)
-            w_q = torch.clamp((w / scale).round(), qmin, qmax) * scale
-            self.llama_model.lm_head.weight.data.copy_(w_q)
-            print("✅ Fake QAT simulated on lm_head weights (INT8 emulation, no observer)")
+            # Siapkan konfigurasi quantization aware training (fake quantization)
+            qat_qconfig = get_default_qat_qconfig("fbgemm")
+            self.llama_model.qconfig = qat_qconfig
+            prepare_qat(self.llama_model, inplace=True)
 
-            # 4️⃣ Ambil embedding
             self.embed_tokens = self.llama_model.get_input_embeddings()
-            print("✅ LLaMA frozen, Fake QAT ready (FP16 compute, INT8-like behavior)")
+            print("✅ Fake QAT prepared (simulated 8-bit quantization, FP16 compute)")
 
-        
         # ============================================================
-        # 🔹 Case 3: Full mode → FP16 (no quantization, no LoRA)
+        # 🔹 Case 2: Full mode → FP16 (no quantization, no LoRA)
         # ============================================================
         else:
             print("→ Full precision mode detected: loading FP16 model")
@@ -137,10 +132,6 @@ class R2GenGPT(pl.LightningModule):
             self.embed_tokens = self.llama_model.get_input_embeddings()
             for name, param in self.llama_model.named_parameters():
                 param.requires_grad = False
-                
-            trainable_params = sum(p.numel() for p in self.llama_model.parameters() if p.requires_grad)
-            total_params = sum(p.numel() for p in self.llama_model.parameters())
-            print(f"[LLM] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
             print("Loading FP16 LLAMA Done ✅")
 
         # ============================================================
@@ -148,8 +139,12 @@ class R2GenGPT(pl.LightningModule):
         # ============================================================
         self.llama_proj = nn.Linear(self.visual_encoder.num_features, self.llama_model.config.hidden_size)
         self.layer_norm = nn.LayerNorm(self.llama_model.config.hidden_size)
+
+        # prompt & buffer
         self.end_sym = args.end_sym
-        self.prompt = 'Generate a comprehensive and detailed diagnosis report for this chest xray image.'
+        self.prompt = (
+            "Generate a comprehensive and detailed diagnosis report for this chest xray image."
+        )
         self.val_step_outputs = []
         self.test_step_outputs = []
         self._epoch_vram = []
@@ -159,7 +154,14 @@ class R2GenGPT(pl.LightningModule):
         self.test_vrams = []
         self.val_score = 0.0
 
+        # delta
         if args.delta_file is not None:
+            # ✅ Kompatibel dengan semua versi Lightning (lama & baru)
+            try:
+                from lightning_fabric.utilities.data import AttributeDict  # Lightning >= 2.0
+            except ImportError:
+                from pytorch_lightning.utilities.data import AttributeDict  # Lightning < 2.0
+
             # Izinkan AttributeDict supaya tidak error saat load
             torch.serialization.add_safe_globals([AttributeDict])
 
@@ -172,157 +174,148 @@ class R2GenGPT(pl.LightningModule):
             # Load ke model
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
-            
-    def _log_gpu_cpu_epoch(self, prefix):
-        """
-        prefix: "train" atau "val"
-        Mengumpulkan:
-        - avg & peak VRAM
-        - avg & peak GPU Util
-        Mendukung:
-        - single GPU
-        - multi-GPU (auto adaptasi)
-        """
-    
-        # ===================== Local GPU Stats =====================
-        avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
-        peak_vram_local = float(max(self._epoch_vram))
-    
-        avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
-        peak_util_local = float(max(self._epoch_util))
-    
-        # convert to tensor
-        t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
-        t_peak_vram = torch.tensor(peak_vram_local, device=self.device)
-        t_avg_util = torch.tensor(avg_util_local, device=self.device)
-        t_peak_util = torch.tensor(peak_util_local, device=self.device)
-    
-        # ===================== All Gather (multi-gpu safe) =====================
-        all_avg_vram = self.all_gather(t_avg_vram).cpu().tolist()
-        all_peak_vram = self.all_gather(t_peak_vram).cpu().tolist()
-        all_avg_util = self.all_gather(t_avg_util).cpu().tolist()
-        all_peak_util = self.all_gather(t_peak_util).cpu().tolist()
-    
-        # ===================== Logging =====================
-        if self.trainer.is_global_zero:
-    
-            num_gpus = len(all_avg_vram)
-    
-            # log otomatis sesuai jumlah GPU (1, 2, 4, ...)
-            for i in range(num_gpus):
-                self.log(f"{prefix}_gpu{i}_avg_vram",
-                         all_avg_vram[i], on_epoch=True, rank_zero_only=True)
-    
-                self.log(f"{prefix}_gpu{i}_peak_vram",
-                         all_peak_vram[i], on_epoch=True, rank_zero_only=True)
-    
-                self.log(f"{prefix}_gpu{i}_avg_util",
-                         all_avg_util[i], on_epoch=True, rank_zero_only=True)
-    
-                self.log(f"{prefix}_gpu{i}_peak_util",
-                         all_peak_util[i], on_epoch=True, rank_zero_only=True)
-    
-            # CPU log
-            mem = psutil.virtual_memory()
-            self.log(f"{prefix}_cpu_ram",
-                     mem.used / (1024 ** 3),
-                     on_epoch=True,
-                     rank_zero_only=True)
-           
+
+
 
     def score(self, ref, hypo):
-        """
-        ref, dictionary of reference sentences (id, sentence)
-        hypo, dictionary of hypothesis sentences (id, sentence)
-        score, dictionary of scores
-        """
         scorers = [
             (Bleu(4), ["Bleu_1", "Bleu_2", "Bleu_3", "Bleu_4"]),
             (Rouge(), "ROUGE_L"),
             (Meteor(), "METEOR"),
-            (Cider(), "CIDEr")
+            (Cider(), "CIDEr"),
         ]
         final_scores = {}
         for scorer, method in scorers:
-            score, scores = scorer.compute_score(ref, hypo)
-            if type(score) == list:
+            score, _ = scorer.compute_score(ref, hypo)
+            if isinstance(score, list):
                 for m, s in zip(method, score):
                     final_scores[m] = s
             else:
                 final_scores[method] = score
         return final_scores
 
-
+    # ============================================================
+    # Image encoder (sudah 4D-safe)
+    # ============================================================
     def encode_img(self, images):
-        image_embeds = []
-        for image in images:
-            device = image.device
-            if self.hparams.global_only:
-                image_embed = self.visual_encoder(image)['pooler_output'].unsqueeze(1).to(device)
-            else:
-                image_embed = self.visual_encoder(image)['last_hidden_state'].to(device)
-            image_embeds.append(image_embed)
-            
-        image_embeds = torch.stack(image_embeds).mean(0)
-        inputs_llama = self.llama_proj(image_embeds)
-        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(image.device)
-        return inputs_llama, atts_llama
+        device = images.device
 
+        # 5D → ambil yang pertama
+        if images.dim() == 5:
+            images = images[:, 0]
+        # 3D → tambah batch
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
 
+        assert images.dim() == 4, f"expect 4D (B,C,H,W), got {images.shape}"
+
+        if self.hparams.global_only:
+            feats = self.visual_encoder(images)["pooler_output"].unsqueeze(1)
+        else:
+            feats = self.visual_encoder(images)["last_hidden_state"]
+
+        feats = self.llama_proj(feats)
+        atts = torch.ones(feats.size()[:-1], dtype=torch.long, device=device)
+        return feats, atts
+
+    # ============================================================
+    # Prompt wrap (perbaikan utama: embed_tokens diambil ulang)
+    # ============================================================
     def prompt_wrap(self, img_embeds, atts_img):
-        prompt=f'Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:'
-        batch_size = img_embeds.shape[0]
-        p_before, p_after = prompt.split('<ImageHere>')
+        device = img_embeds.device
+        embed_tokens = self._get_embed_tokens(device)
+
+        prompt = f"Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:"
+        bsz = img_embeds.size(0)
+        p_before, p_after = prompt.split("<ImageHere>")
+
+        # tokenisasi ke device rank ini
         p_before_tokens = self.llama_tokenizer(
-            p_before, return_tensors="pt", add_special_tokens=False).to(img_embeds.device)
+            p_before, return_tensors="pt", add_special_tokens=False
+        ).to(device)
         p_after_tokens = self.llama_tokenizer(
-            p_after, return_tensors="pt", add_special_tokens=False).to(img_embeds.device)
-        p_before_embeds = self.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
-        p_after_embeds = self.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
-        wrapped_img_embeds = torch.cat([p_before_embeds, img_embeds, p_after_embeds], dim=1)
-        wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.shape[1])
+            p_after, return_tensors="pt", add_special_tokens=False
+        ).to(device)
+
+        # embed pakai embed_tokens yang SUDAH di device rank ini
+        p_before_embeds = embed_tokens(p_before_tokens.input_ids).expand(
+            bsz, -1, -1
+        )
+        p_after_embeds = embed_tokens(p_after_tokens.input_ids).expand(
+            bsz, -1, -1
+        )
+
+        wrapped_img_embeds = torch.cat(
+            [p_before_embeds, img_embeds, p_after_embeds], dim=1
+        )
+        wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.size(1))
+
         return wrapped_img_embeds, wrapped_atts_img
 
-
+    # ============================================================
+    # Forward (train)
+    # ============================================================
     def forward(self, samples):
+        device = next(self.parameters()).device
+
+        # 1) image
         image = samples["image"]
+        if isinstance(image, list):
+            image = torch.stack(image, dim=0)
+        image = image.to(device)
+        if image.dim() == 5 and image.size(1) == 1:
+            image = image[:, 0]
+
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
-
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
+        # 2) text
         self.llama_tokenizer.padding_side = "right"
         text = [t + self.end_sym for t in samples["input_text"]]
-
         to_regress_tokens = self.llama_tokenizer(
             text,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=self.hparams.max_length,
-            add_special_tokens=False
-        ).to(image[0].device)
+            add_special_tokens=False,
+        ).to(device)
 
         targets = to_regress_tokens.input_ids.masked_fill(
             to_regress_tokens.input_ids == 0, -100
         )
 
-        empty_targets = (
-            torch.ones([atts_img.shape[0], atts_img.shape[1]+1],
-                       dtype=torch.long).to(image[0].device).fill_(-100)  # plus one for bos
-        )
+        # 3) kosongkan target utk prompt + BOS
+        empty_targets = torch.ones(
+            (atts_img.size(0), atts_img.size(1) + 1),
+            dtype=torch.long,
+            device=device,
+        ).fill_(-100)
         targets = torch.cat([empty_targets, targets], dim=1)
 
-        batch_size = img_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                         dtype=to_regress_tokens.input_ids.dtype,
-                         device=to_regress_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.embed_tokens(bos)
+        # 4) bangun inputs
+        bsz = img_embeds.size(0)
+        bos = torch.full(
+            (bsz, 1),
+            fill_value=self.llama_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        embed_tokens = self._get_embed_tokens(device)
+
+        bos_embeds = embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
-        to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)
-        inputs_embeds = torch.cat([bos_embeds, img_embeds, to_regress_embeds], dim=1)
-        attention_mask = torch.cat([atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1)
+        to_regress_embeds = embed_tokens(to_regress_tokens.input_ids)
+
+        inputs_embeds = torch.cat(
+            [bos_embeds, img_embeds, to_regress_embeds], dim=1
+        )
+        attention_mask = torch.cat(
+            [atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1
+        )
 
         outputs = self.llama_model(
             inputs_embeds=inputs_embeds,
@@ -337,24 +330,13 @@ class R2GenGPT(pl.LightningModule):
         self._epoch_vram = []
         self._epoch_util = []
 
+    # ============================================================
+    # Lightning hooks
+    # ============================================================
     def training_step(self, batch, batch_idx):
         result = self(batch)
         self.log_dict(result, prog_bar=True)
-
-        # track vram per-step
-        device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-
-        vram = torch.cuda.memory_allocated() / (1024 ** 3)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
-
-        self._epoch_vram.append(vram)
-        self._epoch_util.append(util)
-
         return result
-        
-    def on_train_epoch_end(self):
-        self._log_gpu_cpu_epoch("train")
 
     def save_checkpoint(self, eval_res):
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
@@ -371,39 +353,45 @@ class R2GenGPT(pl.LightningModule):
             "epoch": current_epoch,
             "step":global_step
         }
-        os.makedirs(os.path.join(self.hparams.savedmodel_path, 'weights'), exist_ok=True)
-        save_to = os.path.join(
-            self.hparams.savedmodel_path, 'weights',
-            "checkpoint_epoch{}_step{}_bleu{:3f}_cider{:3f}.pth".format(current_epoch, global_step, eval_res['Bleu_4'], eval_res['CIDEr']),
-        )
-        self.print("Saving checkpoint at step {} to {}.".format(global_step, save_to))
-        torch.save(save_obj, save_to)
-        
-    def on_validation_epoch_start(self):
-        self._epoch_vram = []
-        self._epoch_util = []
-        
-    def validation_step(self, samples, batch_idx):
-        self.llama_tokenizer.padding_side = "right"
-        to_regress_tokens = self.llama_tokenizer(
-            samples['input_text'],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.hparams.max_length,
-            add_special_tokens=False
-        )
+        # 🔹 Buat folder checkpoints
+        ckpt_dir = os.path.abspath(os.path.join(self.hparams.savedmodel_path, "weights"))
+        os.makedirs(ckpt_dir, exist_ok=True)
 
+        filename = f"checkpoint_epoch{current_epoch}_step{global_step}_bleu{eval_res['Bleu_4']:.3f}_cider{eval_res['CIDEr']:.3f}.pth"
+        save_to = os.path.join(ckpt_dir, filename)
+
+        # 🔹 Simpan checkpoint
+        torch.save(save_obj, save_to)
+        print(f"Checkpoint saved at step {global_step} → {save_to}")
+        
+    
+    def validation_step(self, samples, batch_idx):
+        device = next(self.parameters()).device
+
+        # loss
+        with torch.no_grad():
+            out = self(samples)
+            val_loss = out["loss"].detach()
+
+        # generate (harus ulang supaya pakai bos + prompt)
         image = samples["image"]
+        if isinstance(image, list):
+            image = torch.stack(image, dim=0)
+        image = image.to(device)
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
-        batch_size = img_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                         dtype=atts_img.dtype,
-                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.embed_tokens(bos)
+        bsz = img_embeds.size(0)
+        bos = torch.full(
+            (bsz, 1),
+            fill_value=self.llama_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        embed_tokens = self._get_embed_tokens(device)
+        bos_embeds = embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
@@ -422,27 +410,17 @@ class R2GenGPT(pl.LightningModule):
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
-        
-        device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-
-        vram = torch.cuda.memory_allocated() / (1024 ** 3)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
-
-        self._epoch_vram.append(vram)
-        self._epoch_util.append(util)
-
         return hypo, ref
-    
+
     def decode(self, output_token):
-        if output_token[0] == 0:  # the model might output a unknow token <unk> at the beginning. remove it
+        if output_token[0] == 0:
             output_token = output_token[1:]
-        if output_token[0] == 1:  # some users find that there is a start token <s> at the beginning. remove it
+        if output_token[0] == 1:
             output_token = output_token[1:]
-        output_text = self.llama_tokenizer.decode(output_token, add_special_tokens=False)
-        output_text = output_text.split('</s>')[0].strip()
-        output_text = output_text.replace('<unk>', '')
-        return output_text
+        text = self.llama_tokenizer.decode(output_token, add_special_tokens=False)
+        text = text.split("</s>")[0].strip()
+        text = text.replace("<unk>", "")
+        return text
 
     def on_validation_epoch_end(self):
         ref, hypo, ids = [], [], []
@@ -454,62 +432,58 @@ class R2GenGPT(pl.LightningModule):
         ref = {k:[v] for k, v in zip(ids, ref)}
         hypo = {k:[v] for k, v in zip(ids, hypo)}
         eval_res = self.score(ref=ref,hypo=hypo)
-        
-        # 🔄 Sinkron antar GPU (tanpa all_reduce manual)
-        for k, v in eval_res.items():
-            eval_res[k] = self.trainer.strategy.reduce(v, reduce_op="mean")
-            
-        self.log_dict(eval_res, sync_dist=False, logger=True)
+        self.log_dict(eval_res, sync_dist=True, logger=True)
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
-        # ⬇️ Tambahkan rank di nama file agar tidak tabrakan
-        rank = self.global_rank if hasattr(self, "global_rank") else 0
-        json.dump(hypo, open(os.path.join(result_folder, f"result_rank{rank}_{current_epoch}_{global_step}.json"), "w"))
-        json.dump(ref, open(os.path.join(result_folder, f"refs_rank{rank}.json"), "w"))
-        self.print(eval_res)
+        json.dump(hypo, open(os.path.join(result_folder, f"result_{current_epoch}_{global_step}" + '.json'), 'w'))
+        json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
+        print(eval_res)
 
-        val_score = 0.0
+        val_score = 0
         for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):
             val_score += eval_res[score_type] * weight
 
-        # 🔄 Sinkronkan val_score antar GPU (mean semua rank)
-        val_score = self.trainer.strategy.reduce(val_score, reduce_op="mean")
-
-        # 💾 Simpan checkpoint hanya di rank 0, tapi berdasarkan val_score global
-        if self.trainer.is_global_zero:
+        if self.trainer.local_rank == 0:
             if val_score > self.val_score:
                 self.save_checkpoint(eval_res)
                 self.val_score = val_score
-
-        # 🧹 Bersihkan buffer
         self.val_step_outputs.clear()
-        self._log_gpu_cpu_epoch("val")
-        
-        
+
+
     def test_step(self, samples, batch_idx):
-        start = time.time()
         self.llama_tokenizer.padding_side = "right"
+
+        # target
         to_regress_tokens = self.llama_tokenizer(
-            samples['input_text'],
+            samples["input_text"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=self.hparams.max_length,
-            add_special_tokens=False
-        )
+            add_special_tokens=False,
+        ).to(device)
 
+        # image
         image = samples["image"]
+        if isinstance(image, list):
+            image = torch.stack(image, dim=0)
+        image = image.to(device)
+
         img_embeds, atts_img = self.encode_img(image)
         img_embeds = self.layer_norm(img_embeds)
         img_embeds, atts_img = self.prompt_wrap(img_embeds, atts_img)
 
-        batch_size = img_embeds.shape[0]
-        bos = torch.ones([batch_size, 1],
-                         dtype=atts_img.dtype,
-                         device=atts_img.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.embed_tokens(bos)
+        bsz = img_embeds.size(0)
+        bos = torch.full(
+            (bsz, 1),
+            fill_value=self.llama_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        embed_tokens = self._get_embed_tokens(device)
+        bos_embeds = embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
@@ -525,47 +499,26 @@ class R2GenGPT(pl.LightningModule):
             length_penalty=self.hparams.length_penalty,
             temperature=self.hparams.temperature, 
         )
-        # --- timing end ---
-        end = time.time()
-        latency = end - start
-
-        # ===== GPU UTIL + VRAM =====
-        device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
-        vram = pynvml.nvmlDeviceGetMemoryInfo(handle).used / 1024**3
-
-        # ===== Simpan untuk perhitungan final =====
-        self.test_latencies.append(latency)
-        self.test_utils.append(util)
-        self.test_vrams.append(vram)
-        
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
         return hypo, ref
 
-
     def on_test_epoch_end(self):
-        """
-        This function is called at the end of the test epoch.
-        It is recommended to test on single device to ensure each sample/batch gets evaluated exactly once. This is helpful to make sure benchmarking for research papers is done the right way. Otherwise, in a multi-device setting, samples could occur duplicated when DistributedSampler is used, for eg. with strategy="ddp". It replicates some samples on some devices to make sure all devices have same batch size in case of uneven inputs.
-        """
         ref, hypo, ids = [], [], []
-        for i in self.test_step_outputs:
-            ref.extend(i['ref'])
-            hypo.extend(i['hypo'])
-            ids.extend(i['id'])
+        for item in self.test_step_outputs:
+            ref.extend(item["ref"])
+            hypo.extend(item["hypo"])
+            ids.extend(item["id"])
 
-        ref = {k:[v] for k, v in zip(ids, ref)}
-        hypo = {k:[v] for k, v in zip(ids, hypo)}
-        eval_res = self.score(ref=ref,hypo=hypo)
+        ref = {k: [v] for k, v in zip(ids, ref)}
+        hypo = {k: [v] for k, v in zip(ids, hypo)}
+        eval_res = self.score(ref=ref, hypo=hypo)
 
-        result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
+        result_folder = os.path.join(self.hparams.savedmodel_path, "result")
         os.makedirs(result_folder, exist_ok=True)
-        json.dump(hypo, open(os.path.join(result_folder, f"test_result.json"), 'w'))
-        json.dump(ref, open(os.path.join(result_folder, 'test_refs.json'), 'w'))
+        json.dump(hypo, open(os.path.join(result_folder, "test_result.json"), "w"))
+        json.dump(ref, open(os.path.join(result_folder, "test_refs.json"), "w"))
         self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
         # ======== PERFORMANCE LOGGING =========
         avg_lat = float(np.mean(self.test_latencies))
@@ -592,23 +545,16 @@ class R2GenGPT(pl.LightningModule):
             writer.writerow(data)
         self.print(f"[INFO] Saved latency metrics → {csv_path}")
 
+    # ============================================================
+    # Optimizer
+    # ============================================================
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.learning_rate,
-            eps=1e-6,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer=optimizer,
-            T_max=self.hparams.max_epochs,
-            eta_min=1e-6
-        )
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.hparams.max_epochs, eta_min=1e-6)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    # ------------------------------------------------------------
     def get_progress_bar_dict(self):
-        # don't show the version number
         items = super().get_progress_bar_dict()
         items.pop("v_num", None)
         return items
