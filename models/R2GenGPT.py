@@ -301,6 +301,7 @@ class R2GenGPT(pl.LightningModule):
         batch = img_embeds.shape[0]
         device = img_embeds.device
 
+
         # Tokenize
         tok_before = self.llama_tokenizer(
             p_before, return_tensors="pt", add_special_tokens=False
