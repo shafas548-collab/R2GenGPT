@@ -7,6 +7,7 @@ from models.R2GenGPT import R2GenGPT
 from pytorch_lightning import seed_everything
 import pytorch_lightning as pl
 import warnings
+import logging
 import transformers
 
 # 🔇 Matikan warning umum
@@ -16,36 +17,39 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # 🔇 Matikan semua log Hugging Face (transformers)
 transformers.utils.logging.set_verbosity_error()
 
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("absl").setLevel(logging.ERROR)
+
 
 def train(args):
     seed_everything(42, workers=True)
 
-    # 1) bangun model DULU
-    model = build_model(args)
-
-    # 2) baru bangun datamodule
     dm = DataModule(args)
+    callbacks = add_callbacks(args)
 
-    # 3) callback & logger
-    cb = add_callbacks(args)
-
-    # 4) trainer
     trainer = pl.Trainer(
-        accelerator=args.accelerator,   # "gpu"
-        devices=args.devices,           # 2
+        devices=args.devices,
         num_nodes=args.num_nodes,
-        strategy=args.strategy,         # "ddp"
+        strategy=args.strategy,
+        accelerator=args.accelerator,
         precision=args.precision,
         val_check_interval=args.val_check_interval,
         limit_val_batches=args.limit_val_batches,
         max_epochs=args.max_epochs,
         num_sanity_val_steps=args.num_sanity_val_steps,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=cb["callbacks"],
-        logger=cb["loggers"],
+        callbacks=callbacks["callbacks"],
+        logger=callbacks["loggers"]
     )
 
-    # 5) run
+    # 🔥 Load model
+    if args.ckpt_file:
+        model = R2GenGPT.load_from_checkpoint(args.ckpt_file, strict=False)
+    else:
+        model = R2GenGPT(args)
+
+    # 🔥 Run
     if args.test:
         trainer.test(model, datamodule=dm)
     elif args.validate:
@@ -61,5 +65,5 @@ def main():
     train(args)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
