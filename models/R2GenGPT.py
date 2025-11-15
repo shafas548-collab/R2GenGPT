@@ -19,8 +19,6 @@ from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
 from peft import LoraConfig, get_peft_model
 import pdb
-import numpy as np
-import pynvml, psutil, time, csv
 
 class R2GenGPT(pl.LightningModule):
     """
@@ -154,9 +152,6 @@ class R2GenGPT(pl.LightningModule):
         self.test_latencies = []
         self.test_utils = []
         self.test_vrams = []
-        self.test_latencies = []
-        self.test_utils = []
-        self.test_vrams = []
         self.val_score = 0.0
 
         # delta
@@ -179,59 +174,6 @@ class R2GenGPT(pl.LightningModule):
             # Load ke model
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
-        
-    # =========================LOGGING GPU & CPU UTILIZATION TRAIN & VAL=========================          
-    def _log_gpu_cpu_epoch(self, prefix):
-        """
-        prefix: train / val
-        Mengumpulkan:
-        - avg vram dalam 1 epoch
-        - peak vram dalam 1 epoch
-        - avg util
-        - peak util
-        untuk 2 GPU melalui all_gather
-        """
-
-        # local values
-        avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
-        peak_vram_local = float(max(self._epoch_vram))
-
-        avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
-        peak_util_local = float(max(self._epoch_util))
-
-        # convert to tensors for gathering
-        t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
-        t_peak_vram = torch.tensor(peak_vram_local, device=self.device)
-        t_avg_util = torch.tensor(avg_util_local, device=self.device)
-        t_peak_util = torch.tensor(peak_util_local, device=self.device)
-
-        # all ranks gather → shape (world_size,)
-        all_avg_vram = self.all_gather(t_avg_vram).detach().cpu().tolist()
-        all_peak_vram = self.all_gather(t_peak_vram).detach().cpu().tolist()
-
-        all_avg_util = self.all_gather(t_avg_util).detach().cpu().tolist()
-        all_peak_util = self.all_gather(t_peak_util).detach().cpu().tolist()
-
-        # only rank 0 logs
-        if self.trainer.is_global_zero:
-            # GPU0 = index 0, GPU1 = index 1
-            self.log(f"{prefix}_gpu0_avg_vram", all_avg_vram[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_vram", all_avg_vram[1], on_epoch=True, rank_zero_only=True)
-
-            self.log(f"{prefix}_gpu0_peak_vram", all_peak_vram[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_vram", all_peak_vram[1], on_epoch=True, rank_zero_only=True)
-
-            self.log(f"{prefix}_gpu0_avg_util", all_avg_util[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_util", all_avg_util[1], on_epoch=True, rank_zero_only=True)
-
-            self.log(f"{prefix}_gpu0_peak_util", all_peak_util[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_util", all_peak_util[1], on_epoch=True, rank_zero_only=True)
-
-            # CPU snapshot tetap
-            mem = psutil.virtual_memory()
-            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)
-
-            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)
 
 
 
@@ -511,7 +453,6 @@ class R2GenGPT(pl.LightningModule):
 
 
     def test_step(self, samples, batch_idx):
-        start = time.time()
         self.llama_tokenizer.padding_side = "right"
 
         # target
@@ -558,22 +499,6 @@ class R2GenGPT(pl.LightningModule):
             length_penalty=self.hparams.length_penalty,
             temperature=self.hparams.temperature, 
         )
-
-        # --- timing end ---
-        end = time.time()
-        latency = end - start
-
-        # ===== GPU UTIL + VRAM =====
-        device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
-        vram = pynvml.nvmlDeviceGetMemoryInfo(handle).used / 1024**3
-
-        # ===== Simpan untuk perhitungan final =====
-        self.test_latencies.append(latency)
-        self.test_utils.append(util)
-        self.test_vrams.append(vram)
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})

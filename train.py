@@ -7,7 +7,7 @@ from models.R2GenGPT import R2GenGPT
 from pytorch_lightning import seed_everything
 import pytorch_lightning as pl
 import warnings
-import logging
+import warnings, logging
 import transformers
 
 # 🔇 Matikan warning umum
@@ -23,8 +23,6 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 
 
 def train(args):
-    seed_everything(42, workers=True)
-
     dm = DataModule(args)
     callbacks = add_callbacks(args)
 
@@ -34,22 +32,20 @@ def train(args):
         strategy=args.strategy,
         accelerator=args.accelerator,
         precision=args.precision,
-        val_check_interval=args.val_check_interval,
-        limit_val_batches=args.limit_val_batches,
-        max_epochs=args.max_epochs,
-        num_sanity_val_steps=args.num_sanity_val_steps,
+        val_check_interval = args.val_check_interval,
+        limit_val_batches = args.limit_val_batches,
+        max_epochs = args.max_epochs,
+        num_sanity_val_steps = args.num_sanity_val_steps,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=callbacks["callbacks"],
+        callbacks=callbacks["callbacks"], 
         logger=callbacks["loggers"]
     )
 
-    # 🔥 Load model
-    if args.ckpt_file:
+    if args.ckpt_file is not None:
         model = R2GenGPT.load_from_checkpoint(args.ckpt_file, strict=False)
     else:
         model = R2GenGPT(args)
 
-    # 🔥 Run
     if args.test:
         trainer.test(model, datamodule=dm)
     elif args.validate:
@@ -57,13 +53,13 @@ def train(args):
     else:
         trainer.fit(model, datamodule=dm)
 
-
 def main():
     args = parser.parse_args()
     os.makedirs(args.savedmodel_path, exist_ok=True)
     pprint(vars(args))
+    seed_everything(42, workers=True)
     train(args)
 
 
 if __name__ == '__main__':
-    main()
+        main()
