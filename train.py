@@ -7,7 +7,6 @@ from models.R2GenGPT import R2GenGPT
 from pytorch_lightning import seed_everything
 import pytorch_lightning as pl
 import warnings
-import warnings, logging
 import transformers
 
 # 🔇 Matikan warning umum
@@ -21,7 +20,7 @@ logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 
-
+ 
 def train(args):
     dm = DataModule(args)
     callbacks = add_callbacks(args)
@@ -61,5 +60,5 @@ def main():
     train(args)
 
 
-if __name__ == '__main__':
-        main()
+if __name__ == "__main__":
+    main()
