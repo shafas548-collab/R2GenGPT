@@ -77,6 +77,7 @@ class R2GenGPT(pl.LightningModule):
 
             # ✅ Tambahkan LoRA (QLoRA)
             print("Applying QLoRA...")
+            # keep embed_tokens attribute for backward compat but do not assume it's on-device
             self.embed_tokens = self.llama_model.get_input_embeddings()
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
@@ -118,7 +119,7 @@ class R2GenGPT(pl.LightningModule):
             self.llama_model.lm_head.weight.data.copy_(w_q)
             print("✅ Fake QAT simulated on lm_head weights (INT8 emulation, no observer)")
 
-            # 4️⃣ Ambil embedding
+            # 4️⃣ Ambil embedding (tetap simpan referensi)
             self.embed_tokens = self.llama_model.get_input_embeddings()
             print("✅ LLaMA frozen, Fake QAT ready (FP16 compute, INT8-like behavior)")
 
@@ -154,6 +155,7 @@ class R2GenGPT(pl.LightningModule):
         self.test_step_outputs = []
         self._epoch_vram = []
         self._epoch_util = []
+        self._epoch_latencies = []
         self.test_latencies = []
         self.test_utils = []
         self.test_vrams = []
@@ -173,6 +175,23 @@ class R2GenGPT(pl.LightningModule):
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
             
+    # ---------------------------
+    # helper: DDP-safe embed getter
+    # ---------------------------
+    def _get_embed_tokens(self, device):
+        """
+        Return the input embedding module moved (not copied) to 'device'.
+        We return the module itself so calling code can do embed_tokens(input_ids).
+        """
+        # get the embedding layer from the underlying llama_model and ensure it's on the target device
+        emb = self.llama_model.get_input_embeddings()
+        try:
+            emb.to(device)
+        except Exception:
+            # some embedding wrappers might not have .to implemented; rely on calling code to send input ids to device
+            pass
+        return emb
+
     def _log_gpu_cpu_epoch(self, prefix):
         """
         prefix: "train" atau "val"
@@ -186,10 +205,10 @@ class R2GenGPT(pl.LightningModule):
     
         # ===================== Local GPU Stats =====================
         avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
-        peak_vram_local = float(max(self._epoch_vram))
+        peak_vram_local = float(max(self._epoch_vram)) if len(self._epoch_vram) > 0 else 0.0
     
         avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
-        peak_util_local = float(max(self._epoch_util))
+        peak_util_local = float(max(self._epoch_util)) if len(self._epoch_util) > 0 else 0.0
     
         # convert to tensor
         t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
@@ -320,7 +339,7 @@ class R2GenGPT(pl.LightningModule):
             truncation=True,
             max_length=self.hparams.max_length,
             add_special_tokens=False
-        ).to(image[0].device)
+        ).to(img_embeds.device)
 
         targets = to_regress_tokens.input_ids.masked_fill(
             to_regress_tokens.input_ids == 0, -100
@@ -328,7 +347,7 @@ class R2GenGPT(pl.LightningModule):
 
         empty_targets = (
             torch.ones([atts_img.shape[0], atts_img.shape[1]+1],
-                       dtype=torch.long).to(image[0].device).fill_(-100)  # plus one for bos
+                       dtype=torch.long).to(img_embeds.device).fill_(-100)  # plus one for bos
         )
         targets = torch.cat([empty_targets, targets], dim=1)
 
@@ -336,10 +355,14 @@ class R2GenGPT(pl.LightningModule):
         bos = torch.ones([batch_size, 1],
                          dtype=to_regress_tokens.input_ids.dtype,
                          device=to_regress_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.embed_tokens(bos)
+
+        # DDP-safe: ambil embed module di device sekarang
+        embed_tokens = self._get_embed_tokens(img_embeds.device)
+
+        bos_embeds = embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
-        to_regress_embeds = self.embed_tokens(to_regress_tokens.input_ids)
+        to_regress_embeds = embed_tokens(to_regress_tokens.input_ids)
         inputs_embeds = torch.cat([bos_embeds, img_embeds, to_regress_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_img, to_regress_tokens.attention_mask], dim=1)
 
@@ -355,9 +378,13 @@ class R2GenGPT(pl.LightningModule):
     def on_train_epoch_start(self):
         self._epoch_vram = []
         self._epoch_util = []
+        self._epoch_latencies = []
 
     def training_step(self, batch, batch_idx):
+        start = time.time()
         result = self(batch)
+        step_latency = time.time() - start
+        self._epoch_latencies.append(step_latency)
         self.log_dict(result, prog_bar=True)
 
         # track vram per-step
@@ -374,6 +401,30 @@ class R2GenGPT(pl.LightningModule):
         
     def on_train_epoch_end(self):
         self._log_gpu_cpu_epoch("train")
+
+        # ===== CSV Logging for Train =====
+        avg_lat = float(np.mean(self._epoch_latencies)) if len(self._epoch_latencies) else 0
+        std_lat = float(np.std(self._epoch_latencies)) if len(self._epoch_latencies) else 0
+        throughput = 1.0 / avg_lat if avg_lat > 0 else 0.0
+
+        avg_vram = float(np.mean(self._epoch_vram)) if len(self._epoch_vram) else 0
+        peak_vram = float(np.max(self._epoch_vram)) if len(self._epoch_vram) else 0
+        avg_util = float(np.mean(self._epoch_util)) if len(self._epoch_util) else 0
+        peak_util = float(np.max(self._epoch_util)) if len(self._epoch_util) else 0
+
+        csv_path = os.path.join(self.hparams.savedmodel_path, "latensi-train.csv")
+        header = ["epoch", "avg_latency", "std_latency", "throughput",
+                  "avg_util", "peak_util", "avg_vram", "peak_vram"]
+        row = [self.current_epoch, avg_lat, std_lat, throughput,
+               avg_util, peak_util, avg_vram, peak_vram]
+
+        file_exists = os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow(row)
+        self.print(f"[INFO] Saved train latency metrics → {csv_path}")
 
     def save_checkpoint(self, eval_res):
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
@@ -401,6 +452,7 @@ class R2GenGPT(pl.LightningModule):
     def on_validation_epoch_start(self):
         self._epoch_vram = []
         self._epoch_util = []
+        self._epoch_latencies = []
         
     def validation_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
@@ -422,12 +474,18 @@ class R2GenGPT(pl.LightningModule):
         bos = torch.ones([batch_size, 1],
                          dtype=atts_img.dtype,
                          device=atts_img.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.embed_tokens(bos)
+
+        # DDP-safe embed getter
+        embed_tokens = self._get_embed_tokens(img_embeds.device)
+
+        bos_embeds = embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
         attention_mask = torch.cat([atts_bos, atts_img], dim=1)
 
+        # timing around generate
+        start = time.time()
         outputs = self.llama_model.generate(
             inputs_embeds=inputs_embeds,
             num_beams=self.hparams.beam_size,
@@ -438,6 +496,9 @@ class R2GenGPT(pl.LightningModule):
             length_penalty=self.hparams.length_penalty,
             temperature=self.hparams.temperature,
         )
+        step_latency = time.time() - start
+        self._epoch_latencies.append(step_latency)
+
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
@@ -505,6 +566,30 @@ class R2GenGPT(pl.LightningModule):
         # 🧹 Bersihkan buffer
         self.val_step_outputs.clear()
         self._log_gpu_cpu_epoch("val")
+
+        # ===== CSV Logging for Validation =====
+        avg_lat = float(np.mean(self._epoch_latencies)) if len(self._epoch_latencies) else 0
+        std_lat = float(np.std(self._epoch_latencies)) if len(self._epoch_latencies) else 0
+        throughput = 1.0 / avg_lat if avg_lat > 0 else 0.0
+
+        avg_vram = float(np.mean(self._epoch_vram)) if len(self._epoch_vram) else 0
+        peak_vram = float(np.max(self._epoch_vram)) if len(self._epoch_vram) else 0
+        avg_util = float(np.mean(self._epoch_util)) if len(self._epoch_util) else 0
+        peak_util = float(np.max(self._epoch_util)) if len(self._epoch_util) else 0
+
+        csv_path = os.path.join(self.hparams.savedmodel_path, "latensi-val.csv")
+        header = ["epoch", "avg_latency", "std_latency", "throughput",
+                  "avg_util", "peak_util", "avg_vram", "peak_vram"]
+        row = [current_epoch, avg_lat, std_lat, throughput,
+               avg_util, peak_util, avg_vram, peak_vram]
+
+        file_exists = os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow(row)
+        self.print(f"[INFO] Saved validation latency metrics → {csv_path}")
         
         
     def test_step(self, samples, batch_idx):
@@ -528,7 +613,11 @@ class R2GenGPT(pl.LightningModule):
         bos = torch.ones([batch_size, 1],
                          dtype=atts_img.dtype,
                          device=atts_img.device) * self.llama_tokenizer.bos_token_id
-        bos_embeds = self.embed_tokens(bos)
+
+        # DDP-safe embed getter
+        embed_tokens = self._get_embed_tokens(img_embeds.device)
+
+        bos_embeds = embed_tokens(bos)
         atts_bos = atts_img[:, :1]
 
         inputs_embeds = torch.cat([bos_embeds, img_embeds], dim=1)
