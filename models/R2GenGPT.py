@@ -289,35 +289,57 @@ class R2GenGPT(pl.LightningModule):
 
 
     def prompt_wrap(self, img_embeds, atts_img):
-        device = img_embeds.device
-        embed_tokens = self._get_embed_tokens(device)
+        """
+        Ensure: p_before, img_embeds, and p_after have matching batch size and
+        concatenate safely, padding where needed.
+        """
 
-        prompt = f"Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:"
-        bsz = img_embeds.size(0)
+        prompt = f'Human: <Img><ImageHere></Img> {self.prompt} \nAssistant:'
+
+        # Split prompt
         p_before, p_after = prompt.split("<ImageHere>")
+        batch = img_embeds.shape[0]
+        device = img_embeds.device
 
-        # tokenisasi ke device rank ini
-        p_before_tokens = self.llama_tokenizer(
+        # Tokenize
+        tok_before = self.llama_tokenizer(
             p_before, return_tensors="pt", add_special_tokens=False
         ).to(device)
-        p_after_tokens = self.llama_tokenizer(
+        tok_after = self.llama_tokenizer(
             p_after, return_tensors="pt", add_special_tokens=False
         ).to(device)
 
-        # embed pakai embed_tokens yang SUDAH di device rank ini
-        p_before_embeds = embed_tokens(p_before_tokens.input_ids).expand(
-            bsz, -1, -1
-        )
-        p_after_embeds = embed_tokens(p_after_tokens.input_ids).expand(
-            bsz, -1, -1
-        )
+        # Get embeddings
+        before_emb = self.embed_tokens(tok_before.input_ids)     # [1, L1, 4096]
+        after_emb = self.embed_tokens(tok_after.input_ids)       # [1, L2, 4096]
 
-        wrapped_img_embeds = torch.cat(
-            [p_before_embeds, img_embeds, p_after_embeds], dim=1
-        )
-        wrapped_atts_img = atts_img[:, :1].expand(-1, wrapped_img_embeds.size(1))
+        # Expand batch
+        before_emb = before_emb.expand(batch, -1, -1)            # [B, L1, 4096]
+        after_emb = after_emb.expand(batch, -1, -1)              # [B, L2, 4096]
 
-        return wrapped_img_embeds, wrapped_atts_img
+        # ----------------------------------------------------
+        # FIX 🔥: Pastikan panjang img_embeds sama dalam batch
+        # ----------------------------------------------------
+        max_len = img_embeds.shape[1]
+        if not all(img_embeds.shape[1] == max_len for _ in range(batch)):
+            # pad semua image embeds agar sama panjang
+            padded = []
+            for i in range(batch):
+                seq = img_embeds[i]
+                pad_len = max_len - seq.shape[0]
+                if pad_len > 0:
+                    seq = torch.cat([seq, torch.zeros(pad_len, seq.shape[1], device=device)], dim=0)
+                padded.append(seq.unsqueeze(0))
+            img_embeds = torch.cat(padded, dim=0)
+
+        # Wrap embeds
+        wrapped = torch.cat([before_emb, img_embeds, after_emb], dim=1)
+
+        # Attention mask
+        wrapped_atts = torch.ones(wrapped.size()[:2], dtype=torch.long, device=device)
+
+        return wrapped, wrapped_atts
+
 
     # ============================================================
     # Forward (train)
