@@ -236,10 +236,10 @@ class R2GenGPT(pl.LightningModule):
         return wrapped_img_embeds, wrapped_atts_img
 
     def _get_embed_tokens(self, device):
-    """
-    DDP-safe embedding getter.
-    """
-    return self.llama_model.get_input_embeddings().to(device)
+        """
+        DDP-safe embedding getter.
+        """
+        return self.llama_model.get_input_embeddings().to(device)
 
     # ============================================================
     # Forward (train)
