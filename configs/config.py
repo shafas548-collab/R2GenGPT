@@ -29,6 +29,7 @@ parser.add_argument('--global_only', default=False, type=lambda x: (str(x).lower
 parser.add_argument('--warmup_ratio', type=float, default=None, help='Warmup ratio for linear scheduler')
 parser.add_argument('--fake_qat', default=False, type=bool, help='use fake quantization aware training')
 parser.add_argument('--low_resource', default=False, type=bool)
+parser.add_argument('--low_resource', default=False, type=bool, help='use low resource mode (qlora)')
 parser.add_argument('--end_sym', default='</s>', type=str)
 
 # ======================== SavedModel Configs ===========================
